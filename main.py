@@ -1,56 +1,77 @@
-import os, json, hmac, hashlib, subprocess, tempfile
+import os, json, hmac, hashlib, uuid, tempfile, subprocess, datetime
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-
 load_dotenv()
 app = Flask(__name__)
 SECRET = os.getenv("AGENT_GAMES_HMAC_SECRET") or ""
-WASM_FILE = "vfy-policy.wasm"
-ZKEY_FILE = "vfy-policy_final.zkey"
+SEEN_FILE = "seen_proofs.json"
+def seen():
+    try: return set(json.load(open(SEEN_FILE)))
+    except: return set()
+def add_seen(t):
+    s = seen(); s.add(t); json.dump(list(s), open(SEEN_FILE,"w"))
 
-def verify_hmac():
+def verify():
     if not SECRET: return True
-    sig = request.headers.get("x-agent-games-signature")
-    if not sig: return False
-    exp = hmac.new(SECRET.encode(), request.get_data(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(exp, sig)
+    s = request.headers.get("x-agent-games-signature")
+    if not s: return False
+    return hmac.compare_digest(hmac.new(SECRET.encode(), request.get_data(), hashlib.sha256).hexdigest(), s)
 
-# INI KUNCINYA: tandatangani SETIAP respons
 @app.after_request
-def sign_response(resp):
-    if SECRET:
-        sig = hmac.new(SECRET.encode(), resp.get_data(), hashlib.sha256).hexdigest()
-        resp.headers["x-agent-games-signature"] = sig
-    return resp
+def sign(r):
+    if SECRET: r.headers["x-agent-games-signature"] = hmac.new(SECRET.encode(), r.get_data(), hashlib.sha256).hexdigest()
+    return r
 
-@app.route("/agent", methods=["GET"])
-def preflight_get():
-    return jsonify({"ok": True, "protocolVersion": "v1"})
-
-@app.route("/agent", methods=["POST"])
-def handle_task():
-    if not verify_hmac():
-        return jsonify({"error": "Signature salah"}), 401
-    task = request.get_json() or {}
-    print("Task masuk:", task.get("type"))
-    if task.get("type") == "agent-games.preflight.v1":
-        return jsonify({"ok": True, "protocolVersion": "v1"})
-    move = "defend"
-    ci = {"move": move}
+def try_proof(wasm, zkey, inputs):
     try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump(ci, f); ip = f.name
-        pp = ip.replace(".json","_proof.json"); pub = ip.replace(".json","_public.json")
-        subprocess.run(["snarkjs","groth16","fullprove",ip,WASM_FILE,ZKEY_FILE,pp,pub], check=True, capture_output=True, text=True)
-        proof = json.load(open(pp)); signals = json.load(open(pub))
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(inputs, f); ip = f.name
+        pp = ip+"_p.json"; pub = ip+"_s.json"
+        subprocess.run(["snarkjs","groth16","fullprove",ip,wasm,zkey,pp,pub], check=True, capture_output=True, text=True, timeout=40)
+        p = json.load(open(pp)); s = json.load(open(pub))
         os.remove(ip); os.remove(pp); os.remove(pub)
-        data = {"ok": True, "proof": proof, "publicSignals": signals, "move": move}
-        if len(json.dumps(data)) > 15000: data["publicSignals"] = signals[:10]
-        return jsonify(data)
-    except subprocess.CalledProcessError as e:
-        return jsonify({"error": "Proof gagal: " + e.stderr[-800:]}), 500
+        return p, s
     except Exception as e:
-        return jsonify({"error": str(e)[-800:]}), 500
+        print("proof skip:", str(e)[:200]); return None, None
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+@app.route("/agent", methods=["GET","POST"])
+def agent():
+    if request.method == "GET": return jsonify({"ok":True,"protocolVersion":"v1"})
+    if not verify(): return jsonify({"error":"sig"}), 401
+    t = request.get_json() or {}
+    ty = t.get("type","")
+    if ty == "agent-games.preflight.v1":
+        return jsonify({"ok":True,"protocolVersion":"v1"})
+
+    if ty == "agent-games.proof-gatekeeper.v1":
+        i = t.get("input",{})
+        g = lambda k,d="": str(i.get(k,d))
+        decision, reason = "APPROVE", "VALID_CONDITION"
+        if g("proof_vk") != g("registered_vk"): decision,reason="REJECT","VK_SUBSTITUTION"
+        elif int(g("public_balance","0")) < int(g("minimum","0")): decision,reason="REJECT","THRESHOLD_MISMATCH"
+        elif g("recipient") != g("condition_recipient"): decision,reason="REJECT","RECIPIENT_MISMATCH"
+        elif int(g("amount","0")) > int(g("max_transfer","0")): decision,reason="REJECT","AMOUNT_OVERFLOW"
+        elif int(g("current_block","0")) > int(g("expiry_block","0")): decision,reason="REJECT","EXPIRED_CONDITION"
+        elif g("proof_tx") in seen(): decision,reason="REJECT","PROOF_REUSED"
+        if decision=="APPROVE": add_seen(g("proof_tx"))
+        resp = {"decision":decision,"reason_code":reason,"proof_tx":g("proof_tx")}
+        p,s = try_proof("gatekeeper.wasm","gatekeeper_final.zkey", i)
+        if p: resp["proof"]=p; resp["public_signals"]=s
+        return jsonify(resp)
+
+    mid = t.get("matchId"); turn = t.get("turn"); st = t.get("state",{})
+    act = {"type":"EXTRACT","amount":5} if int(st.get("opponentBalance","0"))>0 else {"type":"HOLD"}
+    an = {"HOLD":0,"FORTIFY":1,"EXTRACT":2}[act["type"]]
+    amt = act.get("amount",0)
+    inputs = {"commitment":t.get("strategyCommitment",{}).get("hash","0x0"),
+              "matchId":mid,"turn":turn,"selfBalance":st.get("selfBalance","0"),
+              "opponentBalance":st.get("opponentBalance","0"),"action":an,"amount":amt,"circuitVersion":1}
+    p,s = try_proof("vfy-policy.wasm","vfy-policy_final.zkey", inputs)
+    resp = {"matchId":mid,"turn":turn,"action":act,
+            "agentTimestamp":datetime.datetime.utcnow().isoformat()+"Z",
+            "idempotencyKey":str(uuid.uuid4())}
+    if p: resp["policyProof"]={"circuitVersion":"v1","proof":p,"public_signals":s}
+    return jsonify(resp)
+
+if __name__=="__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT",5000)))
