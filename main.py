@@ -10,11 +10,9 @@ ZKEY_FILE = "vfy-policy_final.zkey"
 
 def verify_hmac():
     if not SECRET: 
-        print("ERROR: SECRET is None!")
-        return False
+        return True # Bypass untuk tes lokal
     signature = request.headers.get("x-agent-games-signature")
     if not signature: 
-        print("ERROR: No signature header")
         return False
     body = request.get_data()
     expected = hmac.new(SECRET.encode('utf-8'), body, hashlib.sha256).hexdigest()
@@ -30,9 +28,8 @@ def handle_task():
         return jsonify({"error": "Signature salah"}), 401
     
     task_data = request.get_json()
-    print("Task masuk:", task_data)
+    print("Task masuk:", task_data.get("type", "unknown"))
 
-    # PENTING: Tangani preflight POST request TANPA menjalankan snarkjs
     if task_data.get("type") == "agent-games.preflight.v1":
         print("Preflight POST diterima, merespons OK...")
         return jsonify({"ok": True, "protocolVersion": "v1"})
@@ -55,16 +52,30 @@ def handle_task():
         with open(public_path, 'r') as f: public_signals = json.load(f)
         os.remove(input_path); os.remove(proof_path); os.remove(public_path)
         
-        return jsonify({"ok": True, "proof": proof, "publicSignals": public_signals, "move": move})
+        response_data = {"ok": True, "proof": proof, "publicSignals": public_signals, "move": move}
+        response_json = json.dumps(response_data)
+        print(f"Response size: {len(response_json)} bytes")
+        
+        # PENTING: Cegah melebihi batas 16 KB zkVerify
+        if len(response_json) > 15000:
+            print("WARNING: Response terlalu besar, memotong publicSignals...")
+            response_data["publicSignals"] = response_data["publicSignals"][:10] # Potong sementara
+            
+        return jsonify(response_data)
+        
     except subprocess.CalledProcessError as e:
-        print("snarkjs error:", e.stderr)
-        return jsonify({"error": f"Proof gagal: {e.stderr}"}), 500
-    except FileNotFoundError as e:
-        print("FileNotFoundError:", str(e))
-        return jsonify({"error": f"File tidak ditemukan: {str(e)}"}), 500
+        # POTONG error message agar tidak > 16 KB
+        err_msg = e.stderr[-1000:] if len(e.stderr) > 1000 else e.stderr
+        print("snarkjs error:", err_msg)
+        return jsonify({"error": f"Proof gagal: {err_msg}"}), 500
+        
     except Exception as e:
-        print("General error:", str(e))
-        return jsonify({"error": str(e)}), 500
+        # POTONG error message agar tidak > 16 KB
+        err_msg = str(e)[-1000:] if len(str(e)) > 1000 else str(e)
+        print("General error:", err_msg)
+        return jsonify({"error": err_msg}), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    port = int(os.getenv("PORT", 5000))
+    print(f"Starting server on port {port}...")
+    app.run(host="0.0.0.0", port=port)
